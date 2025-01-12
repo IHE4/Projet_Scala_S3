@@ -1,0 +1,140 @@
+import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.functions._
+import org.apache.spark.graphx._
+import org.apache.log4j.{Level, Logger}
+import scala.collection.mutable
+import org.apache.spark.rdd.RDD
+
+object TweetAnalysis {
+  def main(args: Array[String]): Unit = {
+    // Masquer les logs
+    Logger.getLogger("org").setLevel(Level.OFF)
+    Logger.getLogger("akka").setLevel(Level.OFF)
+    Logger.getRootLogger.setLevel(Level.OFF)
+
+    // Initialiser SparkSession
+    val spark = SparkSession.builder()
+      .appName("Analyse des Tweets avec GraphX")
+      .master("local[*]") // Exécution locale
+      .getOrCreate()
+    // Pour les dates
+    spark.conf.set("spark.sql.legacy.timeParserPolicy", "LEGACY")
+
+
+    // Charger les données CSV
+    val tweetsDF = spark.read
+      .option("header", "true")
+      .option("inferSchema", "true")
+      .csv("twitter_comment.csv")
+
+    println("Avant nettoyage :")
+    tweetsDF.show(5)
+
+    // Nettoyer et préparer les données
+    val tweetsCleanedDF = tweetsDF
+      .withColumn("mentions", regexp_extract_all(col("text"), "@\\w+"))
+      .withColumn("hashtags", regexp_extract_all(col("text"), "#\\w+"))
+      .select("tweet_id", "date", "user_name", "text", "mentions", "hashtags")
+
+    println("Après nettoyage :")
+    tweetsCleanedDF.show(5, truncate = false)
+
+    // Construire les RDDs pour le graphe
+    val vertices: RDD[(VertexId, String)] = tweetsCleanedDF
+      .rdd
+      .flatMap(row => {
+        val user = row.getAs[String]("user_name")
+        val mentions = row.getAs[mutable.ArraySeq[String]]("mentions").toSeq
+        val hashtags = row.getAs[mutable.ArraySeq[String]]("hashtags").toSeq
+        (Seq(user) ++ mentions ++ hashtags).distinct.map(name => (name.hashCode.toLong, name))
+      })
+
+    println("Noeuds/Sommets :")
+    vertices.take(10).foreach { case (id, name) =>
+      println(s"VertexId: $id, Name: $name")
+    }
+
+    val edges: RDD[Edge[String]] = tweetsCleanedDF
+      .rdd
+      .flatMap(row => {
+        val user = row.getAs[String]("user_name")
+        val mentions = row.getAs[mutable.ArraySeq[String]]("mentions").toSeq
+        val hashtags = row.getAs[mutable.ArraySeq[String]]("hashtags").toSeq
+        val mentionEdges = mentions.map(mention => Edge(user.hashCode.toLong, mention.hashCode.toLong, "mention"))
+        val hashtagEdges = hashtags.map(hashtag => Edge(user.hashCode.toLong, hashtag.hashCode.toLong, "hashtag"))
+        mentionEdges ++ hashtagEdges
+      })
+
+    println("Arêtes :")
+    edges.take(10).foreach { case Edge(src, dst, relation) =>
+      println(s"Source: $src, Destination: $dst, Relation: $relation")
+    }
+
+    // Créer le graphe
+    val graph = Graph(vertices, edges)
+    println(s"Nombre de noeuds : ${graph.vertices.count()}")
+    println(s"Nombre d'arêtes : ${graph.edges.count()}")
+
+    // **Affichage explicite des triplets**
+    println("Exemple de triplets :")
+    graph.triplets.take(10).foreach { triplet =>
+      println(s"Source: ${triplet.srcAttr}, Destination: ${triplet.dstAttr}, Relation: ${triplet.attr}")
+    }
+
+    // **Filtrage des utilisateurs en fonction d'une date**
+    val filteredUsers = tweetsCleanedDF
+      .filter(to_date(col("date"), "EEE MMM dd HH:mm:ss z yyyy") > lit("2009-04-06"))
+      .select("user_name", "date")
+      .distinct()
+
+
+
+    println("Utilisateurs après la date spécifiée :")
+    filteredUsers.show(10, truncate = false) // Afficher les 10 premiers résultats
+
+    // **Analyse avec PageRank **
+    val ranks = graph.pageRank(0.0001).vertices
+
+    // Joindre les scores de PageRank avec les noms des sommets
+    val ranksWithNames = ranks.join(vertices).map {
+      case (id, (rank, name)) => (name, rank)
+    }
+
+    // Supprimer les doublons sur les noms et conserver le score maximal
+    val uniqueRanksWithNames = ranksWithNames
+      .reduceByKey((a, b) => Math.max(a, b)) // Conserver le score le plus élevé pour chaque nom
+
+    // Trier par score décroissant et prendre les 10 premiers
+    println("Top 10 noeuds les plus influents :")
+    uniqueRanksWithNames
+      .sortBy(-_._2) // Trier par score décroissant
+      .take(10)
+      .foreach { case (name, rank) =>
+        println(f"$name%-20s Score: $rank%.5f")
+      }
+
+    // **Analyse avec Connected Components**
+    val connectedComponents = graph.connectedComponents().vertices
+    val componentsWithNames = connectedComponents.join(vertices).map {
+      case (id, (componentId, name)) => (componentId, name)
+    }
+    println("Exemple de composants connectés :")
+    componentsWithNames.groupByKey().take(5).foreach { case (componentId, members) =>
+      println(s"Composant $componentId :")
+      members.take(10).foreach(member => println(s"  - $member"))
+    }
+
+    // Stopper SparkSession
+    spark.stop()
+  }
+
+  // Fonction UDF pour extraire toutes les occurrences avec une regex
+  def regexp_extract_all(column: org.apache.spark.sql.Column, pattern: String): org.apache.spark.sql.Column = {
+    import org.apache.spark.sql.functions.udf
+    val extractAll = udf((text: String) => {
+      if (text == null) Seq.empty[String]
+      else pattern.r.findAllIn(text).toSeq
+    })
+    extractAll(column)
+  }
+}
